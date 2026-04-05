@@ -1,19 +1,31 @@
 # bot.py
 import asyncio
 import re
+import os
+import sys
 from datetime import datetime
 from typing import Optional, Tuple
+import logging
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import FloodWait, RPCError
 
 # ==================== CONFIGURATION ====================
-API_ID = 32597791
-API_HASH = "011dc530b6232ccee97a45bb2db196bb"
-BOT_TOKEN = "8701935704:AAHo1S_ccPEAzZU2DxyKdL-uy7sgtlhQ9EY"
-ADMIN_ID = 8574753078
+# Use environment variables for security (RECOMMENDED)
+API_ID = int(os.getenv("API_ID", 32597791))
+API_HASH = os.getenv("API_HASH", "011dc530b6232ccee97a45bb2db196bb")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8701935704:AAHo1S_ccPEAzZU2DxyKdL-uy7sgtlhQ9EY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 8574753078))
 
 # Premium pricing
 PREMIUM_PLANS = {
@@ -43,13 +55,46 @@ YDL_OPTS = {
     }],
 }
 
-# Initialize bot
-app = Client(
-    "music_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+# Initialize bot with error handling
+async def init_bot():
+    """Initialize bot with retry logic"""
+    retry_count = 0
+    max_retries = 3
+    
+    while retry_count < max_retries:
+        try:
+            app = Client(
+                "music_bot",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=BOT_TOKEN,
+                workdir="./bot_data"  # Separate directory for session files
+            )
+            
+            # Test connection
+            await app.start()
+            me = await app.get_me()
+            logger.info(f"Bot started successfully as @{me.username}")
+            return app
+            
+        except FloodWait as e:
+            wait_time = e.value
+            logger.warning(f"FloodWait: Need to wait {wait_time} seconds")
+            retry_count += 1
+            
+            if retry_count < max_retries:
+                logger.info(f"Waiting {wait_time} seconds before retry {retry_count}/{max_retries}")
+                await asyncio.sleep(min(wait_time, 60))  # Wait max 60 seconds
+            else:
+                logger.error("Max retries reached. Exiting...")
+                sys.exit(1)
+                
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            retry_count += 1
+            await asyncio.sleep(5)
+    
+    sys.exit(1)
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -87,41 +132,46 @@ async def search_youtube(query: str, max_results: int = 1) -> list:
             'extract_flat': False,
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info without downloading
-            info = await asyncio.to_thread(ydl.extract_info, search_query, download=False)
-            
-            if not info or 'entries' not in info:
-                return []
-            
-            results = []
-            for entry in info['entries'][:max_results]:
-                if entry:
-                    # Get best audio format URL
-                    audio_url = None
-                    if 'url' in entry:
-                        audio_url = entry['url']
-                    elif 'formats' in entry:
-                        # Find best audio format
-                        audio_formats = [f for f in entry['formats'] if f.get('acodec') != 'none']
-                        if audio_formats:
-                            best_audio = max(audio_formats, key=lambda f: f.get('abr', 0))
-                            audio_url = best_audio.get('url')
-                    
-                    if audio_url:
-                        results.append({
-                            'title': entry.get('title', 'Unknown Title'),
-                            'duration': entry.get('duration'),
-                            'uploader': entry.get('uploader', 'Unknown'),
-                            'url': audio_url,
-                            'webpage_url': entry.get('webpage_url', ''),
-                            'thumbnail': entry.get('thumbnail', '')
-                        })
-            
-            return results
-            
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def extract_info():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(search_query, download=False)
+        
+        info = await loop.run_in_executor(None, extract_info)
+        
+        if not info or 'entries' not in info:
+            return []
+        
+        results = []
+        for entry in info['entries'][:max_results]:
+            if entry:
+                # Get best audio format URL
+                audio_url = None
+                if 'url' in entry:
+                    audio_url = entry['url']
+                elif 'formats' in entry:
+                    # Find best audio format
+                    audio_formats = [f for f in entry['formats'] if f.get('acodec') != 'none']
+                    if audio_formats:
+                        best_audio = max(audio_formats, key=lambda f: f.get('abr', 0))
+                        audio_url = best_audio.get('url')
+                
+                if audio_url:
+                    results.append({
+                        'title': entry.get('title', 'Unknown Title'),
+                        'duration': entry.get('duration'),
+                        'uploader': entry.get('uploader', 'Unknown'),
+                        'url': audio_url,
+                        'webpage_url': entry.get('webpage_url', ''),
+                        'thumbnail': entry.get('thumbnail', '')
+                    })
+        
+        return results
+        
     except Exception as e:
-        print(f"YouTube search error: {e}")
+        logger.error(f"YouTube search error: {e}")
         return []
 
 async def get_trending_songs() -> list:
@@ -147,11 +197,16 @@ async def start_command(client: Client, message: Message):
         "Enjoy your music! 🎧"
     )
     
-    await message.reply_text(
-        welcome_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=get_main_keyboard()
-    )
+    try:
+        await message.reply_text(
+            welcome_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_main_keyboard()
+        )
+    except FloodWait as e:
+        logger.warning(f"FloodWait in start_command: {e.value} seconds")
+        await asyncio.sleep(e.value)
+        await message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
 @app.on_message(filters.text & ~filters.command(["start", "help"]))
 async def handle_song_request(client: Client, message: Message):
@@ -219,8 +274,16 @@ async def handle_song_request(client: Client, message: Message):
             ])
         )
         
+    except FloodWait as e:
+        logger.warning(f"FloodWait in song request: {e.value} seconds")
+        await asyncio.sleep(e.value)
+        await processing_msg.edit_text(
+            "⚠️ **Rate limited!**\n\n"
+            "Please wait a moment before trying again.",
+            reply_markup=get_main_keyboard()
+        )
     except Exception as e:
-        print(f"Error in handle_song_request: {e}")
+        logger.error(f"Error in handle_song_request: {e}")
         await processing_msg.edit_text(
             "❌ **Something went wrong!**\n\n"
             "Please try again later or contact support.",
@@ -232,26 +295,38 @@ async def handle_song_request(client: Client, message: Message):
 @app.on_callback_query()
 async def handle_callbacks(client: Client, callback_query: CallbackQuery):
     """Handle all callback queries"""
-    data = callback_query.data
-    
-    if data == "trending":
-        await show_trending_songs(callback_query)
-    
-    elif data == "premium":
-        await show_premium_plans(callback_query)
-    
-    elif data == "refresh":
-        await callback_query.message.delete()
-        await callback_query.answer("Send me a song name to get started!", show_alert=True)
-    
-    elif data.startswith("premium_"):
-        plan_id = data.replace("premium_", "")
-        plan = PREMIUM_PLANS.get(plan_id)
-        if plan:
-            await handle_premium_purchase(callback_query, plan)
-    
-    else:
-        await callback_query.answer("Invalid option!", show_alert=True)
+    try:
+        data = callback_query.data
+        
+        if data == "trending":
+            await show_trending_songs(callback_query)
+        
+        elif data == "premium":
+            await show_premium_plans(callback_query)
+        
+        elif data == "refresh":
+            await callback_query.message.delete()
+            await callback_query.answer("Send me a song name to get started!", show_alert=True)
+        
+        elif data.startswith("premium_"):
+            plan_id = data.replace("premium_", "")
+            plan = PREMIUM_PLANS.get(plan_id)
+            if plan:
+                await handle_premium_purchase(callback_query, plan)
+        
+        elif data == "back_to_menu":
+            await back_to_menu(client, callback_query)
+        
+        else:
+            await callback_query.answer("Invalid option!", show_alert=True)
+            
+    except FloodWait as e:
+        logger.warning(f"FloodWait in callback: {e.value} seconds")
+        await asyncio.sleep(e.value)
+        await callback_query.answer("Please wait a moment...", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error in callback: {e}")
+        await callback_query.answer("An error occurred!", show_alert=True)
 
 async def show_trending_songs(callback_query: CallbackQuery):
     """Show trending songs to user"""
@@ -274,7 +349,7 @@ async def show_trending_songs(callback_query: CallbackQuery):
         
         # Format trending songs list
         text = "🔥 **Top Trending Songs Today**\n\n"
-        for idx, song in enumerate(trending_songs, 1):
+        for idx, song in enumerate(trending_songs[:10], 1):
             duration = format_duration(song['duration'])
             text += f"{idx}. **{song['title'][:50]}**\n   ⏱️ `{duration}`\n\n"
         
@@ -282,9 +357,9 @@ async def show_trending_songs(callback_query: CallbackQuery):
         
         # Create buttons for top 5 songs
         buttons = []
-        for idx, song in enumerate(trending_songs[:5], 1):
+        for idx in range(min(5, len(trending_songs))):
             buttons.append([
-                InlineKeyboardButton(f"🎵 {idx}. Play", callback_data=f"play_{idx}")
+                InlineKeyboardButton(f"🎵 {idx+1}. Play", callback_data=f"play_{idx}")
             ])
         
         buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")])
@@ -299,7 +374,7 @@ async def show_trending_songs(callback_query: CallbackQuery):
         )
         
     except Exception as e:
-        print(f"Error in show_trending_songs: {e}")
+        logger.error(f"Error in show_trending_songs: {e}")
         await trending_msg.edit_text(
             "❌ **Error fetching trending songs!**\n\nPlease try again.",
             reply_markup=get_main_keyboard()
@@ -308,7 +383,7 @@ async def show_trending_songs(callback_query: CallbackQuery):
 @app.on_callback_query(lambda c: c.data.startswith("play_"))
 async def play_trending_song(client: Client, callback_query: CallbackQuery):
     """Play selected trending song"""
-    song_index = int(callback_query.data.split("_")[1]) - 1
+    song_index = int(callback_query.data.split("_")[1])
     
     trending_songs = getattr(callback_query.message, '_trending_songs', None)
     
@@ -329,20 +404,29 @@ async def play_trending_song(client: Client, callback_query: CallbackQuery):
         f"🔥 *Trending Song*"
     )
     
-    await callback_query.message.reply_audio(
-        audio=song['url'],
-        caption=caption,
-        title=song['title'],
-        performer=song['uploader'],
-        duration=song['duration'],
-        thumb=song['thumbnail'] if song['thumbnail'] else None,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 YouTube Link", url=song['webpage_url'])]
-        ])
-    )
+    try:
+        await callback_query.message.reply_audio(
+            audio=song['url'],
+            caption=caption,
+            title=song['title'],
+            performer=song['uploader'],
+            duration=song['duration'],
+            thumb=song['thumbnail'] if song['thumbnail'] else None,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 YouTube Link", url=song['webpage_url'])]
+            ])
+        )
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await callback_query.message.reply_audio(
+            audio=song['url'],
+            caption=caption,
+            title=song['title'],
+            performer=song['uploader'],
+            duration=song['duration']
+        )
 
-@app.on_callback_query(lambda c: c.data == "back_to_menu")
 async def back_to_menu(client: Client, callback_query: CallbackQuery):
     """Return to main menu"""
     await callback_query.message.edit_text(
@@ -457,8 +541,16 @@ async def handle_utr(client: Client, message: Message):
             parse_mode=ParseMode.MARKDOWN
         )
         
+    except FloodWait as e:
+        logger.warning(f"FloodWait in UTR handler: {e.value} seconds")
+        await asyncio.sleep(e.value)
+        await message.reply_text(
+            "✅ **UTR Received!**\n\n"
+            "Thank you for your purchase! Our team will verify and activate your premium within 24 hours.",
+            parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
-        print(f"Error sending UTR to admin: {e}")
+        logger.error(f"Error sending UTR to admin: {e}")
         await message.reply_text(
             "❌ **Error submitting UTR!**\n\n"
             "Please contact support directly.",
@@ -488,7 +580,11 @@ async def activate_premium(client: Client, callback_query: CallbackQuery):
         )
         await callback_query.answer("Premium activated!")
         
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await callback_query.answer("Premium activated!", show_alert=True)
     except Exception as e:
+        logger.error(f"Error activating premium: {e}")
         await callback_query.answer(f"Error: {str(e)}", show_alert=True)
 
 @app.on_callback_query(lambda c: c.data.startswith("reject_"))
@@ -513,6 +609,7 @@ async def reject_premium(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Request rejected!")
         
     except Exception as e:
+        logger.error(f"Error rejecting premium: {e}")
         await callback_query.answer(f"Error: {str(e)}", show_alert=True)
 
 @app.on_callback_query(lambda c: c.data.startswith("reply_"))
@@ -530,17 +627,28 @@ async def reply_to_user(client: Client, callback_query: CallbackQuery):
     callback_query.message._reply_to_user = user_id
     await callback_query.answer()
 
-# ==================== ERROR HANDLERS ====================
-
-@app.on_message(filters.incoming & ~filters.me)
-async def error_handler(_, message: Message):
-    """Global error handler for all messages"""
-    # This is a placeholder - actual errors are handled in individual functions
-    pass
-
 # ==================== MAIN ====================
 
+async def main():
+    """Main function to run the bot"""
+    global app
+    app = await init_bot()
+    
+    # Add handlers
+    @app.on_message()
+    async def _(client, message):
+        pass  # Placeholder for any additional handlers
+    
+    logger.info("✅ Bot is running and ready!")
+    
+    # Keep the bot running
+    await asyncio.Event().wait()
+
 if __name__ == "__main__":
-    print("🤖 Music Bot Started!")
-    print("✅ Bot is running...")
-    app.run()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)

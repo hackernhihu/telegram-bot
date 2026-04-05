@@ -7,7 +7,7 @@ API_ID = int(os.getenv("32597791"))
 API_HASH = os.getenv("011dc530b6232ccee97a45bb2db196bb")
 BOT_TOKEN = os.getenv("8701935704:AAHo1S_ccPEAzZU2DxyKdL-uy7sgtlhQ9EY")
 
-app = Client("rs_music_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("RsMusicHubBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ===== START =====
 @app.on_message(filters.command("start"))

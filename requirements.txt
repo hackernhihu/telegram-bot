@@ -3,3 +3,4 @@ tgcrypto==1.2.5
 yt-dlp==2024.4.9
 python-dotenv==1.0.1
 aiofiles==23.2.1
+python-telegram-bot==20.7
